@@ -12,7 +12,7 @@ gflags.DEFINE_integer('batch_size', 64, '')
 FLAGS = gflags.FLAGS
 FLAGS(sys.argv)
 
-data.cache_train_files(train_dir=FLAGS.train_dir, recache=True)
+data.cache_train_files(directory=FLAGS.train_dir, recache=True)
 train_files = data.get_files(data.TRAIN, num_pipelines=8)
 values = data.get_test_values(train_files, batch_size=FLAGS.batch_size, num_test_crops=1)
 

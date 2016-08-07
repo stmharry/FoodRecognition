@@ -25,23 +25,28 @@ tf.app.flags.DEFINE_integer('num_test_crops', 1, 'random cropping at testing tim
 tf.app.flags.DEFINE_integer('num_gpus', 1, 'number of GPUs used. [default: 1]')
 tf.app.flags.DEFINE_integer('train_iteration', 10000, 'number of iterations if used with --command=train. [default: 10000]')
 tf.app.flags.DEFINE_integer('lr_half_per', 1500, 'learning rate half life. [default: 1500]')
+tf.app.flags.DEFINE_float('subsample_ratio', 1.0, 'subsample ratio for training images. [default: 1.0')
 tf.app.flags.DEFINE_float('lr', 1e-1, 'initial learning rate. [default: 1e-1]')
 tf.app.flags.DEFINE_float('lr_slow', 0.0, 'relative learning rate for shallow layers. (so its learning rate would be (lr * lr_slow). [default: 0.0]')
 tf.app.flags.DEFINE_float('weight_decay', 0.0, 'weight decay for convolutional kernels. [default: 0.0]')
-tf.app.flags.DEFINE_string('command', 'none', '"train" to run the pre-schuduled training scheme, "test" to run tests and generate log file, and "none" to do nothing. [default: none]')
-tf.app.flags.DEFINE_string('log_file', '/tmp/test_log.csv', 'log file name for test, used with --command=test. [default: test_log.csv]')
+tf.app.flags.DEFINE_string('command', 'none', '"train" to run the pre-schuduled training scheme, "test" to run tests and generate log file, "online" to run as a server, and "none" to do nothing. [default: none]')
+tf.app.flags.DEFINE_string('log_file', '/tmp/test_log.csv', 'log file name for test, used with --command=test. [default: /tmp/test_log.csv]')
 tf.app.flags.DEFINE_string('working_dir', '/tmp', 'working directory for saving logs and models. [default: /tmp]')
 tf.app.flags.DEFINE_string('train_dir', None, 'directory for files to be trained.')
 tf.app.flags.DEFINE_string('test_dir', None, 'directory for files to be tested, leave blank for validation split. [default: none]')
-tf.app.flags.DEFINE_string('test_attrs', 'key,label,logit', 'names for test logging.')
+tf.app.flags.DEFINE_string('test_attrs', 'key,pred_name', 'names for test logging.')
 FLAGS = tf.app.flags.FLAGS
 FLAGS._parse_flags()
+
+if FLAGS.batch_size == -1:
+    FLAGS.batch_size = FLAGS.num_test_crops
 
 LEARNING_RATE_RELATIVE_DICT = dict(normal=1.0, slow=FLAGS.lr_slow)
 NET_VARIABLES = 'net_variables'
 
 TRAIN = 0
 TEST = 1
+TEST_ALT = 2
 PHASES = [TRAIN, TEST]
 NAMES = {TRAIN: 'train', TEST: 'test'}
 
@@ -126,7 +131,7 @@ def conv(value, conv_name, out_channel, size=(1, 1), stride=(1, 1), padding='SAM
             mean = tf.get_variable(
                 'mean',
                 shape=(out_channel,),
-                initializer=mean_initializer,
+                classeinitializer=mean_initializer,
                 trainable=False,
                 collections=[tf.GraphKeys.VARIABLES, NET_VARIABLES])
             variance = tf.get_variable(
@@ -206,8 +211,11 @@ def softmax(value, dim):
 
 
 def segment_mean(value):
+    shape = image_util.get_shape(value)
     test_batch_size_per_gpu = (FLAGS.batch_size / FLAGS.num_test_crops) / FLAGS.num_gpus
-    return tf.segment_mean(value, np.repeat(np.arange(test_batch_size_per_gpu), FLAGS.num_test_crops))
+    value = tf.segment_mean(value, np.repeat(np.arange(test_batch_size_per_gpu), FLAGS.num_test_crops))
+    value.set_shape((None,) + shape[1:])
+    return value
 
 
 ''' Parameters
@@ -241,18 +249,19 @@ if FLAGS.command == 'train':
 
 ''' Pipeline
 '''
-data.cache_train_files(train_dir=FLAGS.train_dir)
+data.cache_train_files(directory=FLAGS.train_dir)
 
-if not FLAGS.command == 'test':
-    train_files = data.get_files(data.DEV, num_pipelines=FLAGS.num_train_pipelines)
+if FLAGS.command == 'train' or FLAGS.command == 'none':
+    train_files = data.get_files(data.DEV, num_pipelines=FLAGS.num_train_pipelines, subsample_ratio=FLAGS.subsample_ratio, directory=FLAGS.train_dir)
     train_values = data.get_train_values(
         train_files,
         batch_size=FLAGS.batch_size)
 
-if FLAGS.test_dir is None:
-    test_files = data.get_files(data.VAL, num_pipelines=FLAGS.num_test_pipelines)
-else:
-    test_files = data.get_files(data.TEST, num_pipelines=FLAGS.num_test_pipelines, test_dir=FLAGS.test_dir)
+if FLAGS.command == 'train':
+    test_files = data.get_files(data.VAL, num_pipelines=FLAGS.num_test_pipelines, directory=FLAGS.train_dir)
+elif FLAGS.command == 'test':
+    test_files = data.get_files(data.TEST, num_pipelines=FLAGS.num_test_pipelines, directory=FLAGS.test_dir)
+elif
 test_values = data.get_test_values(
     test_files,
     batch_size=FLAGS.batch_size,
@@ -268,13 +277,13 @@ class_names = tf.get_variable(
     trainable=False,
     collections=[tf.GraphKeys.VARIABLES, NET_VARIABLES])
 
-
 if FLAGS.command == 'test':
     (key, image, label) = test_values
 else:
     (key, image, label) = tf.case([
         (tf.equal(phase, TRAIN), lambda: train_values),
         (tf.equal(phase, TEST), lambda: test_values)], default=lambda: train_values)
+
 key.set_shape((None,))
 image.set_shape((None, data.SIZE, data.SIZE, 3))
 label.set_shape((None,))
@@ -308,14 +317,19 @@ for num_gpu in xrange(FLAGS.num_gpus):
 
             with tf.variable_scope('fc'):
                 value = avg_pool(value, 'avg-pool', size=(7, 7))
+                size = image_util.get_size(value)
                 feat = tf.case([
                     (tf.equal(phase, TRAIN), lambda: value),
                     (tf.equal(phase, TEST), lambda: segment_mean(value))], default=lambda: value)
+                feat.set_shape((None,) + size)
                 value = conv(value, 'fc', out_channel=len(data.CLASS_NAMES), biased=True)
-                logit = tf.squeeze(softmax(value, dim=3), squeeze_dims=(1, 2))
+
+                value = tf.squeeze(softmax(value, dim=3), squeeze_dims=(1, 2))
+                size = image_util.get_size(value)
                 logit = tf.case([
-                    (tf.equal(phase, TRAIN), lambda: logit),
-                    (tf.equal(phase, TEST), lambda: segment_mean(logit))], default=lambda: logit)
+                    (tf.equal(phase, TRAIN), lambda: value),
+                    (tf.equal(phase, TEST), lambda: segment_mean(value))], default=lambda: value)
+                logit.set_shape((None,) + size)
 
             target = tf.one_hot(label_splits[num_gpu], len(data.CLASS_NAMES))
             loss = - tf.reduce_mean(target * tf.log(logit + util.EPSILON)) * len(data.CLASS_NAMES)
@@ -332,11 +346,15 @@ for num_gpu in xrange(FLAGS.num_gpus):
 
 logit = tf.concat(0, logit_splits)
 prediction = tf.argmax(logit, 1)
-acc = tf.reduce_mean(tf.to_float(tf.equal(prediction, label)))
-acc.set_shape(())
+pred_name = tf.gather(class_names, prediction)
+correct = tf.to_float(tf.equal(prediction, label))
 
+acc = tf.reduce_mean(correct)
 loss = tf.reduce_mean(tf.pack(loss_splits))
-loss.set_shape(())
+
+target = tf.one_hot(label, len(data.CLASS_NAMES))
+target_frac = tf.reduce_mean(target, 0)
+correct_frac = tf.reduce_mean(tf.expand_dims(correct, 1) * target, 0)
 
 grads = [tf.reduce_mean(tf.pack(grads_for_var), reduction_indices=0) for grads_for_var in zip(*grads_splits)]
 var_grads = dict(zip(tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES), grads))
@@ -351,27 +369,34 @@ for (learning_mode, learning_rate_relative) in LEARNING_RATE_RELATIVE_DICT.iteri
             epsilon=1.0).apply_gradients(grad_vars))
 train_op = tf.group(*train_ops)
 
-local_attrs = ['loss', 'acc']
-global_attrs = ['learning_rate']
 postfix_funcs = {
-    TRAIN: [
-        ('', lambda v: v),
-        ('_avg', lambda v: util.exponential_moving_average(v, num_updates=global_step))],
-    TEST: [
-        ('', lambda v: util.moving_average(v, window=test_iteration))]}
+    TRAIN: {
+        'raw': lambda x: x,
+        'avg': lambda x: util.exponential_moving_average(x, num_updates=global_step)},
+    TEST: {
+        'avg': lambda x: util.moving_average(x, window=test_iteration)}}
 
 display_dict = {
-    p: {
-        '%s_%s%s' % (NAMES[p], attr, postfix): func(globals()[attr])
-        for (postfix, func) in postfix_funcs[p]
-        for attr in local_attrs}
-    for p in PHASES}
+    TRAIN: {attr: globals()[attr] for attr in ['learning_rate']},
+    TEST: {}}
 
-display_dict[TRAIN].update({
-    attr: globals()[attr] for attr in global_attrs})
+for p in PHASES:
+    for (postfix, func) in postfix_funcs[p].iteritems():
+        for attr in ['loss', 'acc']:
+            display_dict[p].update({
+                '%s_%s_%s' % (NAMES[p], attr, postfix): func(globals()[attr])})
+
+summary_dict = {k: v.copy() for (k, v) in display_dict.iteritems()}
+
+for p in PHASES:
+    (postfix, func) = ('avg', postfix_funcs[p]['avg'])
+    accs = func(correct_frac) / (func(target_frac) + util.EPSILON)
+    for (i, class_name) in enumerate(data.CLASS_NAMES):
+        summary_dict[p].update({
+            '%s_acc(%s)_%s' % (NAMES[p], class_name, postfix): accs[i]})
 
 summary = {
-    p: tf.merge_summary([tf.scalar_summary(k, v) for (k, v) in display_dict[p].iteritems()])
+    p: tf.merge_summary([tf.scalar_summary(k, v) for (k, v) in summary_dict[p].iteritems()])
     for p in PHASES}
 
 sess = tf.InteractiveSession(config=tf.ConfigProto(allow_soft_placement=True))
@@ -401,6 +426,7 @@ def train(iteration=FLAGS.train_iteration):
             dict(fetch=dict(train=train_op)),
             dict(fetch=display_dict[TRAIN],
                  func=lambda **kwargs: model.display(begin='Train', end='\n', **kwargs)),
+            dict(fetch=summary_dict[TRAIN]),
             dict(interval=5,
                  fetch=dict(summary=summary[TRAIN]),
                  func=lambda **kwargs: model.summary(summary_writer=summary_writer, **kwargs)),
@@ -417,6 +443,7 @@ def val():
         callbacks=[
             dict(fetch=display_dict[TEST],
                  func=lambda **kwargs: model.display(begin='\033[2K\rVal', end='', **kwargs)),
+            dict(fetch=summary_dict[TEST]),
             dict(interval=-1,
                  func=lambda **kwargs: print('')),
             dict(interval=-1,
