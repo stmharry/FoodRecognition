@@ -16,10 +16,6 @@ RESNET_MAT = scipy.io.loadmat(RESNET_MAT_PATH)
 WORKING_DIR = ''  # TODO
 
 
-def identity(value):
-    return value
-
-
 class Image(object):
     NUM_TEST_CROPS = 4
     TRAIN_SIZE_RANGE = (256, 512)
@@ -173,6 +169,9 @@ class Net(object):
         self.train_op = tf.group(*train_ops)
 
     def make_show(self):
+        def identity(value):
+            return value
+
         postfix_funcs = {
             Net.Phase.TRAIN: {
                 'raw': identity,
@@ -223,7 +222,7 @@ class ResNet(Net):
             trainable = False
 
         if conv_name in RESNET_MAT:
-            print('%s initialized from %s' % (conv_name, RESNET_MAT_PATH))
+            print('%s initialized from ResNet' % conv_name)
             weights_initializer = tf.constant_initializer(RESNET_MAT[conv_name][0][0])
         else:
             print('%s initialized randomly' % conv_name)
@@ -266,7 +265,7 @@ class ResNet(Net):
             scale_name = 'scale%s' % norm_name
 
             if bn_name in RESNET_MAT:
-                print('%s initialized from %s' % (bn_name, RESNET_MAT_PATH))
+                print('%s initialized from ResNet' % bn_name)
                 mean_initializer = tf.constant_initializer(RESNET_MAT[bn_name][0][0][:, 0])
                 variance_initializer = tf.constant_initializer(RESNET_MAT[bn_name][1][0][:, 0])
             else:
@@ -289,7 +288,7 @@ class ResNet(Net):
                     collections=Net.NET_COLLECTIONS)
 
             if scale_name in RESNET_MAT:
-                print('%s initialized from %s' % (scale_name, RESNET_MAT_PATH))
+                print('%s initialized from ResNet' % scale_name)
                 scale_initializer = tf.constant_initializer(RESNET_MAT[scale_name][0][0][:, 0])
                 offset_initializer = tf.constant_initializer(RESNET_MAT[scale_name][1][0][:, 0])
             else:
