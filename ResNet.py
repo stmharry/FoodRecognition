@@ -11,8 +11,7 @@ import data
 from deepbox import util, image_util
 from deepbox.model import Model
 
-RESNET_MAT_PATH = '/mnt/data/ResNet-50-params.mat'  # TODO
-RESNET_MAT = scipy.io.loadmat(RESNET_MAT_PATH)
+RESNET_PARAMS_PATH = '/mnt/data/ResNet-50-params.mat'  # TODO
 WORKING_DIR = ''  # TODO
 
 
@@ -30,7 +29,7 @@ class Image(object):
         image = image_util.random_crop(image, size=Image.NET_SIZE)
         image = image_util.random_flip(image)
         image = image_util.random_adjust_rgb(image)
-        image = image - RESNET_MAT['mean']
+        image = image - self.resnet_params['mean']
 
         image.set_shape((Image.NET_SIZE, Image.NET_SIZE, Image.NET_CHANNEL))
         return image
@@ -44,7 +43,7 @@ class Image(object):
             image = image_util.random_resize(image, size_range=Image.TEST_SIZE_RANGE)
             image = image_util.random_crop(image, size=Image.NET_SIZE)
             image = image_util.random_flip(image)
-            image = image - RESNET_MAT['mean']
+            image = image - self.resnet_params['mean']
             return image
 
         image = tf.map_fn(test_image_map, image)
@@ -137,11 +136,29 @@ class Net(object):
         return value
 
     def __init__(self, phase, image, label, is_train=False, is_show=False):
-        self.phase = phase
+        self.phase = tf.to_int64(phase)
         self.image = image
         self.label = tf.to_int64(label)
         self.is_train = is_train
         self.is_show = is_show
+        self.checkpoint = tf.train.get_checkpoint_state(WORKING_DIR)
+        if self.checkpoint:
+            self.resnet_params = None
+        else:
+            self.resnet_params = scipy.io.loadmat(RESNET_PARAMS_PATH)
+
+    def get_initializer(self, name, index, is_vector, default):
+        if self.checkpoint:
+            return None
+        elif name in self.resnet_params:
+            print('%s initialized from ResNet' % name)
+            if is_vector:
+                value = self.resnet_params[name][index][0][:, 0]
+            else:
+                value = self.resnet_params[name][index][0]
+            return tf.constant_initializer(value)
+        else:
+            return default
 
     def make_stat(self):
         assert hasattr(self, 'logit')
@@ -199,10 +216,9 @@ class Net(object):
         self.summary_writer = tf.train.SummaryWriter(WORKING_DIR)
 
         self.sess.run(tf.initialize_all_variables())
-        checkpoint = tf.train.get_checkpoint_state(WORKING_DIR)
-        if checkpoint:
-            print('[ Model restored from %s ]' % checkpoint.model_checkpoint_path)
-            self.saver.restore(tf.get_default_session(), checkpoint.model_checkpoint_path)
+        if self.checkpoint:
+            print('[ Model restored from %s ]' % self.checkpoint.model_checkpoint_path)
+            self.saver.restore(tf.get_default_session(), self.checkpoint.model_checkpoint_path)
 
         tf.train.start_queue_runners()
         print('[ Filling queues with images ]')
@@ -221,12 +237,12 @@ class ResNet(Net):
             collections = Net.NET_COLLECTIONS
             trainable = False
 
-        if conv_name in RESNET_MAT:
-            print('%s initialized from ResNet' % conv_name)
-            weights_initializer = tf.constant_initializer(RESNET_MAT[conv_name][0][0])
-        else:
-            print('%s initialized randomly' % conv_name)
-            weights_initializer = tf.truncated_normal_initializer(stddev=(2. / (in_channel * stride[0] * stride[1])) ** 0.5)
+
+        weights_initializer = self.get_initializer(
+            conv_name,
+            index=0,
+            is_vector=False,
+            default=tf.truncated_normal_initializer(stddev=(2. / (in_channel * stride[0] * stride[1])) ** 0.5))
 
         if Net.WEIGHT_DECAY > 0:
             weight_regularizer = tf.contrib.layers.l2_regularizer(Net.WEIGHT_DECAY)
@@ -245,10 +261,11 @@ class ResNet(Net):
         value = tf.nn.conv2d(value, weight, strides=Net.expand(stride), padding=padding)
 
         if biased:
-            if conv_name in RESNET_MAT:
-                bias_initializer = tf.constant_initializer(RESNET_MAT[conv_name][1][0][:, 0])
-            else:
-                bias_initializer = tf.constant_initializer(0.1)
+            bias_initializer = self.get_initializer(
+                conv_name,
+                index=1,
+                is_vector=True,
+                default=tf.constant_initializer(0.1))
 
             with tf.variable_scope(conv_name):
                 bias = tf.get_variable(
@@ -264,14 +281,17 @@ class ResNet(Net):
             bn_name = 'bn%s' % norm_name
             scale_name = 'scale%s' % norm_name
 
-            if bn_name in RESNET_MAT:
-                print('%s initialized from ResNet' % bn_name)
-                mean_initializer = tf.constant_initializer(RESNET_MAT[bn_name][0][0][:, 0])
-                variance_initializer = tf.constant_initializer(RESNET_MAT[bn_name][1][0][:, 0])
-            else:
-                print('%s initialized with constant' % bn_name)
-                mean_initializer = tf.constant_initializer(0.0)
-                variance_initializer = tf.constant_initializer(1.0)
+            mean_initializer = self.get_initializer(
+                bn_name,
+                index=0,
+                is_vector=True,
+                default=tf.constant_initializer(0.0))
+
+            variance_initializer = self.get_initializer(
+                bn_name,
+                index=1,
+                is_vector=True,
+                default=tf.constant_initializer(1.0))
 
             with tf.variable_scope(bn_name):
                 mean = tf.get_variable(
@@ -287,14 +307,17 @@ class ResNet(Net):
                     trainable=False,
                     collections=Net.NET_COLLECTIONS)
 
-            if scale_name in RESNET_MAT:
-                print('%s initialized from ResNet' % scale_name)
-                scale_initializer = tf.constant_initializer(RESNET_MAT[scale_name][0][0][:, 0])
-                offset_initializer = tf.constant_initializer(RESNET_MAT[scale_name][1][0][:, 0])
-            else:
-                print('%s initialized with constant' % scale_name)
-                scale_initializer = tf.constant_initializer(1.0)
-                offset_initializer = tf.constant_initializer(0.0)
+            scale_initializer = self.get_initializer(
+                scale_name,
+                index=0,
+                is_vector=True,
+                default=tf.constant_initializer(1.0))
+
+            offset_initializer = self.get_initializer(
+                scale_name,
+                index=1,
+                is_vector=True,
+                default=tf.constant_initializer(0.0))
 
             with tf.variable_scope(scale_name):
                 scale = tf.get_variable(
