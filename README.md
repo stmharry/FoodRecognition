@@ -10,20 +10,21 @@
     sudo apt-get update
     sudo apt-get install nvidia-367
     ```
-0. Install `CUDA 8.0` without installing graphics driver (download [here](https://developer.nvidia.com/cuda-toolkit), use `.run` to optionally disable installing the graphics driver)
+0. Install `CUDA 8.0` without installing graphics driver (download [here](https://developer.nvidia.com/cuda-toolkit), use `.run` to optionally disable installing the graphics driver), and install patch for `gcc 5.4`
 
     ```bash
-    sudo sh cuda_8.0.27_linux.run
+    sudo sh cuda_8.0.27_linux.run --silent --toolkit --override
+    sudo sh cuda_8.0.27.1_linux.run --silent --accept-eula
     ```
-0. Install `cuDNN 5` (download [here](https://developer.nvidia.com/cudnn))
+0. Install `cuDNN 5.1.5` (download [here](https://developer.nvidia.com/cudnn))
 
     ```bash
-    sudo tar -zxvf cudnn-8.0-linux-x64-v5.0-ga.tgz --directory /usr/local/
+    sudo tar -zxvf cudnn-8.0-linux-x64-v5.1.tgz --directory /usr/local/
     ```
 0. `apt-get` dependencies
 
     ```bash
-    sudo apt-get install python-pip python-dev python-wheel python-numpy git zlib1g-dev swig 
+    sudo apt-get install python-pip python-dev python-wheel python-numpy git zlib1g-dev swig imagemagick
     ``` 
     
 0. `pip` dependencies
@@ -47,10 +48,12 @@
     ```
 0. Install TensorFlow from source (follow [here](https://www.tensorflow.org/versions/r0.9/get_started/os_setup.html#installing-from-sources))
 
-    ```bash
-    git clone https://github.com/tensorflow/tensorflow
+    ```bash 
+    git clone https://github.com/tensorflow/tensorflow 
     cd tensorflow
-    ./configure [CUDA: 8.0, cuDNN: 5, compute capability: 6.1]
+    git checkout ea9e00a630f91a459dd5858cb22e8cd1a666ba4e
+    git pull
+    ./configure [CUDA: 8, cuDNN: 5.1.5, compute capability: 6.1]
     bazel build -c opt --config=cuda //tensorflow/tools/pip_package:build_pip_package
     bazel-bin/tensorflow/tools/pip_package/build_pip_package /tmp/tensorflow_pkg
     pip install /tmp/tensorflow_pkg/tensorflow-* [the name depends]

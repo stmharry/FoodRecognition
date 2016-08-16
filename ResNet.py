@@ -1,24 +1,50 @@
+'''
+TODO
+1: ImageLabel format class
+2: Seperate file pool
+'''
+
 from __future__ import print_function
 
 import enum
 import numpy as np
 import os
-import scipy
+import scipy.io
+import subprocess
+import sys
 import tensorflow as tf
+import time
 
 from deepbox import util, image_util
 from deepbox.model import Model
 
 
 class Meta(object):
-    WORKING_DIR = '/tmp/' + str(int(time.time()))
-    CLASSNAMES_FILENAME = 'class_names'
-
+    WORKING_DIR = '/tmp/' + time.strftime('%Y%-m-%d-%H%M%S')
+    CLASSNAMES_FILENAME = 'class_names.txt'
     CLASS_NAMES = list()
-    NUM_CLASSES = 0
+
+    @staticmethod
+    def classnamesPath():
+        return os.path.join(Meta.WORKING_DIR, Meta.CLASSNAMES_FILENAME)
+
+    @staticmethod
+    def save(class_names=CLASS_NAMES):
+        Meta.CLASS_NAMES = class_names
+
+        if not os.path.isdir(Meta.WORKING_DIR):
+            os.makedirs(Meta.WORKING_DIR)
+        np.savetxt(Meta.classnamesPath(), Meta.CLASS_NAMES, delimiter=',', fmt='%s')
+
+    @staticmethod
+    def load(working_dir=WORKING_DIR):
+        Meta.WORKING_DIR = working_dir
+
+        if os.path.isfile(Meta.classnamesPath()):
+            Meta.CLASS_NAMES = np.loadtxt(Meta.classnamesPath(), dtype=np.str, delimiter=',')
 
 
-class Input(object):
+class InputProducer(object):
     @staticmethod
     def get_queue(value_list, dtype):
         queue = tf.FIFOQueue(32, dtypes=[dtype], shapes=[()])
@@ -27,10 +53,16 @@ class Input(object):
         tf.train.add_queue_runner(queue_runner)
         return queue
 
-    def __init__(self, image_dir, is_train=False, subsample_size=1, subsample_inv=False):
-        self.filename_list = list()
-        self.hash_list = list()
-        self.classname_list = list()
+    def fromPlaceholder(self, image, label=None):
+        if label is None:
+            label = tf.constant(-1, dtype=tf.int64)
+        return (image, label)
+
+    def fromFile(self, image_dir, is_train=False, subsample_size=1, subsample_divisible=True, check=False, shuffle=False):
+        filename_list = list()
+        hash_list = list()
+        classname_list = list()
+
         for class_name in os.listdir(image_dir):
             class_dir = os.path.join(image_dir, class_name)
             if class_name.startswith('.') or not os.path.isdir(class_dir):
@@ -39,24 +71,47 @@ class Input(object):
                 for file_name in file_names:
                     if not file_name.endswith('.jpg'):
                         continue
-                    hash_ = hash(file_name)
-                    if (hash_ % subsample_size == 0) == subsample_inv:
+                    if (hash(file_name) % subsample_size == 0) != subsample_divisible:
                         continue
-                    self.filename_list.append(os.path.join(file_dir, file_name))
-                    self.hash_list.append(hash_)
-                    self.classname_list.append(class_name)
+                    filename_list.append(os.path.join(file_dir, file_name))
+                    classname_list.append(class_name)
 
-        self.filename_queue = Input.get_queue(self.filename_list, dtype=tf.string)
-        (key, value) = tf.WholeFileReader.read(self.filename_queue)
-        self.image = tf.to_float(tf.image.decode_jpeg(value))
+        if check:
+            num_file_list = list()
+            for (num_file, filename) in enumerate(filename_list):
+                print('\033[2K\rChecking image %d / %d' % (num_file + 1, len(filename_list)), end='')
+                sp = subprocess.Popen(['identify', filename], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                (stdout, stderr) = sp.communicate()
+                if stderr:
+                    os.remove(filename)
+                    print('\nRemove %s' % filename)
+                else:
+                    num_file_list.append(num_file)
+                sys.stdout.flush()
+            print('')
 
-        self.classname_queue = Input.get_queue(self.classname_list, dtype=tf.string)
-        self.class_name = self.classname_queue.dequeue()
+            filename_list = map(filename_list.__getitem__, num_file_list)
+            classname_list = map(classname_list.__getitem__, num_file_list)
+
+        if shuffle:
+            perm = np.random.permutation(len(filename_list))
+            filename_list = map(filename_list.__getitem__, perm)
+            classname_list = map(classname_list.__getitem__, perm)
+
+        class_names = sorted(set(classname_list))
+        label_list = map(class_names.index, classname_list)
+
+        filename_queue = InputProducer.get_queue(filename_list, dtype=tf.string)
+        (key, value) = tf.WholeFileReader().read(filename_queue)
+        image = tf.to_float(tf.image.decode_jpeg(value))
+
+        label_queue = InputProducer.get_queue(label_list, dtype=tf.int64)
+        label = label_queue.dequeue()
 
         if is_train:
-            class_names = sorted(set(self.classname_list))
-            Meta.CLASS_NAMES = class_names
-            Meta.NUM_CLASSES = len(class_names)
+            Meta.save(class_names=class_names)
+
+        return (image, label)
 
 
 class ImagePipeline(object):
@@ -84,7 +139,7 @@ class ImagePipeline(object):
         self.shape = (net_size, net_size, net_channel)
 
         self.mean_path = mean_path
-        self.mean = scipy.io.loadmat(mean_path)
+        self.mean = scipy.io.loadmat(mean_path)['mean']
 
     def train(self, image):
         image = tf.to_float(image)
@@ -97,7 +152,7 @@ class ImagePipeline(object):
         image.set_shape(self.shape)
         return image
 
-    def test_up(self, image):
+    def test(self, image):
         image = tf.to_float(image)
         image = tf.tile(tf.expand_dims(image, dim=0), multiples=(self.num_test_crops, 1, 1, 1))
 
@@ -112,52 +167,79 @@ class ImagePipeline(object):
         image.set_shape((self.num_test_crops,) + self.shape)
         return image
 
-    def test_down(self, image):
-        shape = image_util.get_shape(image)
-        image = tf.reshape(image, (shape[0] * shape[1],) + self.shape)
-        return image
-
     def online(self, image):
-        return self.test_up(image)
+        return self.test(image)
+
+
+class ImageLabelPipeline(ImagePipeline):
+    def __init__(self,
+                 num_test_crops=ImagePipeline.NUM_TEST_CROPS,
+                 train_size_range=ImagePipeline.TRAIN_SIZE_RANGE,
+                 test_size_range=ImagePipeline.TEST_SIZE_RANGE,
+                 net_size=ImagePipeline.NET_SIZE,
+                 net_channel=ImagePipeline.NET_CHANNEL,
+                 mean_path=ImagePipeline.MEAN_PATH):
+
+        super(ImageLabelPipeline, self).__init__(
+            num_test_crops=num_test_crops,
+            train_size_range=train_size_range,
+            test_size_range=test_size_range,
+            net_size=net_size,
+            net_channel=net_channel,
+            mean_path=mean_path)
+
+    def train(self, image, label):
+        return (super(ImageLabelPipeline, self).train(image), label)
+
+    def test(self, image, label):
+        return (super(ImageLabelPipeline, self).test(image), label)
+
+    def online(self, image, label):
+        return (super(ImageLabelPipeline, self).online(image), label)
 
 
 class Batch(object):
-    TRAIN_BATCH_SIZE = 64
-    TRAIN_CAPACITY = 4096 + 512
-    TRAIN_MIN_AFTER_DEQUEUE = 4096
+    BATCH_SIZE = 64
+    CAPACITY = 4096 + 512
+    MIN_AFTER_DEQUEUE = 4096
+    NUM_TEST_CROPS = 4
     NUM_TRAIN_THREADS = 8
-    TEST_BATCH_SIZE = TRAIN_BATCH_SIZE / ImagePipeline.NUM_TEST_CROPS
     NUM_TEST_THREADS = 1
 
     def __init__(self,
-                 train_batch_size=TRAIN_BATCH_SIZE,
-                 train_capacity=TRAIN_CAPACITY,
-                 train_min_after_dequeue=TRAIN_MIN_AFTER_DEQUEUE,
+                 batch_size=BATCH_SIZE,
+                 capacity=CAPACITY,
+                 min_after_dequeue=MIN_AFTER_DEQUEUE,
+                 num_test_crops=NUM_TEST_CROPS,
                  num_train_threads=NUM_TRAIN_THREADS,
-                 test_batch_size=TEST_BATCH_SIZE,
                  num_test_threads=NUM_TEST_THREADS):
 
-        self.train_batch_size = train_batch_size
-        self.train_capacity = train_capacity
-        self.train_min_after_dequeue = train_min_after_dequeue
+        self.batch_size = batch_size
+        self.capacity = capacity
+        self.min_after_dequeue = min_after_dequeue
+        self.num_test_crops = num_test_crops
         self.num_train_threads = num_train_threads
-        self.test_batch_size = test_batch_size
         self.num_test_threads = num_test_threads
 
-    def train(self, args_list):
-        return tf.train.shuffle_batch_join(
-            args_list,
-            batch_size=self.train_batch_size,
+    def train(self, image, label):
+        (image, label) = tf.train.shuffle_batch(
+            (image, label),
+            batch_size=self.batch_size,
             num_threads=self.num_train_threads,
-            capacity=self.train_capacity,
-            min_after_dequeue=self.train_min_after_dequeue)
+            capacity=self.capacity,
+            min_after_dequeue=self.min_after_dequeue)
+        return (image, label)
 
-    def test(self, args_list):
-        return tf.train.batch_join(
-            args_list,
-            batch_size=self.test_batch_size,
+    def test(self, image, label):
+        (image, label) = tf.train.batch(
+            (image, label),
+            batch_size=self.batch_size / self.num_test_crops,
             num_threads=self.num_test_threads,
-            capacity=self.test_batch_size)
+            capacity=self.batch_size / self.num_test_crops)
+
+        shape = image_util.get_shape(image)
+        image = tf.reshape(image, (self.batch_size,) + shape[2:])
+        return (image, label)
 
 
 class Net(object):
@@ -169,7 +251,9 @@ class Net(object):
     NET_COLLECTIONS = [tf.GraphKeys.VARIABLES, NET_VARIABLES]
 
     LEARNING_RATE = 1e-1
-    LEARNING_MODES = dict(normal=1.0, slow=0.0)
+    LEARNING_RATE_MODES = dict(normal=1.0, slow=0.0)
+    LEARNING_RATE_DECAY_STEPS = 0
+    LEARNING_RATE_DECAY_RATE = 1.0
     WEIGHT_DECAY = 0.0
 
     @staticmethod
@@ -210,55 +294,57 @@ class Net(object):
         return value
 
     def __init__(self,
-                 image,
-                 class_name=str(),
                  learning_rate=LEARNING_RATE,
-                 learning_modes=LEARNING_MODES,
+                 learning_modes=LEARNING_RATE_MODES,
+                 learning_rate_decay_steps=LEARNING_RATE_DECAY_STEPS,
+                 learning_rate_decay_rate=LEARNING_RATE_DECAY_RATE,
                  weight_decay=WEIGHT_DECAY,
-                 working_dir=WORKING_DIR,
-                 classnames_filename=CLASSNAMES_FILENAME,
                  is_train=False,
                  is_show=False):
+        assert Meta.CLASS_NAMES, 'Only create net when Meta.CLASS_NAMES is not empty!'
 
-        self.image = image
-        self.class_name = class_name
         self.learning_rate = Net.get_const_variable(learning_rate, 'learning_rate')
         self.learning_modes = learning_modes
         self.weight_decay = weight_decay
-
-        self.working_dir = working_dir
-        self.checkpoint = tf.train.get_checkpoint_state(working_dir)
-        classnames_path = os.path.join(working_dir, classnames_filename)
         self.is_train = is_train
         self.is_show = is_show
 
         self.phase = Net.placeholder('phase', shape=())
-        if self.checkpoint:
-            self.class_names = np.loadtxt(classnames_path, dtype=np.str, delimiter=',')
-        else:
-            np.savetxt(classnames_path, Net.CLASS_NAMES, delimiter=',', fmt='%s')
-        self.class_names = Net.get_const_variable(Input.CLASS_NAMES, 'class_names', shape=(Input.NUM_CLASSES,), dtype=tf.string)
+        self.class_names = Net.get_const_variable(Meta.CLASS_NAMES, 'class_names', shape=(len(Meta.CLASS_NAMES),), dtype=tf.string)
         self.global_step = Net.get_const_variable(0, 'global_step')
+        self.checkpoint = tf.train.get_checkpoint_state(Meta.WORKING_DIR)
+
+        if (learning_rate_decay_steps > 0) and (learning_rate_decay_rate < 1.0):
+            self.learning_rate = tf.train.exponential_decay(
+                self.learning_rate,
+                global_step=self.global_step,
+                decay_steps=learning_rate_decay_steps,
+                decay_rate=learning_rate_decay_rate,
+                staircase=True)
+
+    def case(self, phase_fn_pairs):
+        pred_fn_pairs = [(tf.equal(self.phase, phase_.value), fn) for (phase_, fn) in phase_fn_pairs]
+        value = tf.case(pred_fn_pairs, default=pred_fn_pairs[0][1])
+        return value
 
     def make_stat(self):
-        assert hasattr(self, 'prob')
+        assert hasattr(self, 'prob'), 'net has no attribute "prob"!'
 
-        self.target = tf.equal(self.class_names, self.class_name)
+        self.target = tf.one_hot(self.label, len(Meta.CLASS_NAMES))
         self.target_frac = tf.reduce_mean(self.target, 0)
-        self.loss = - tf.reduce_mean(self.target * tf.log(self.prob + util.EPSILON)) * Input.NUM_CLASSES
+        self.loss = - tf.reduce_mean(self.target * tf.log(self.prob + util.EPSILON)) * len(Meta.CLASS_NAMES)
         regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
         if regularization_losses:
             self.loss += tf.add_n(regularization_losses)
 
-        self.label = tf.argmax(self.target, 1)
-        self.pred_label = tf.argmax(self.prob, 1)
-        self.pred_classname = tf.gather(self.class_names, self.pred_label)
-        self.correct = tf.to_float(tf.equal(self.label, self.pred_label))
+        self.pred = tf.argmax(self.prob, 1)
+        self.correct = tf.to_float(tf.equal(self.label, self.pred))
         self.correct_frac = tf.reduce_mean(tf.expand_dims(self.correct, 1) * self.target, 0)
+        self.acc = tf.reduce_mean(self.correct)
 
     def make_train_op(self):
         train_ops = []
-        for (learning_mode, learning_rate_relative) in Net.LEARNING_MODES.iteritems():
+        for (learning_mode, learning_rate_relative) in Net.LEARNING_RATE_MODES.iteritems():
             variables = tf.get_collection(learning_mode)
             if variables:
                 train_ops.append(tf.train.AdamOptimizer(
@@ -275,7 +361,8 @@ class Net(object):
                 'raw': identity,
                 'avg': lambda value: util.exponential_moving_average(value, num_updates=self.global_step)},
             Net.Phase.TEST: {
-                'raw': identity}}
+                'raw': identity,
+                'avg': lambda value: util.exponential_moving_average(value, num_updates=self.global_step)}}
 
         self.show_dict = {
             phase: {
@@ -294,12 +381,12 @@ class Net(object):
     def finalize(self):
         self.sess = tf.InteractiveSession(config=tf.ConfigProto(allow_soft_placement=True))
         self.saver = tf.train.Saver(tf.get_collection(Net.NET_VARIABLES), keep_checkpoint_every_n_hours=1.0)
-        self.summary_writer = tf.train.SummaryWriter(WORKING_DIR)
+        self.summary_writer = tf.train.SummaryWriter(Meta.WORKING_DIR)
 
         self.sess.run(tf.initialize_all_variables())
-        if Net.CHECKPOINT:
-            print('Model restored from %s' % Net.CHECKPOINT.model_checkpoint_path)
-            self.saver.restore(tf.get_default_session(), Net.CHECKPOINT.model_checkpoint_path)
+        if self.checkpoint:
+            print('Model restored from %s' % self.checkpoint.model_checkpoint_path)
+            self.saver.restore(tf.get_default_session(), self.checkpoint.model_checkpoint_path)
 
         tf.train.start_queue_runners()
         print('Filling queues with images...')
@@ -308,26 +395,32 @@ class Net(object):
 
 class ResNet(Net):
     RESNET_PARAMS_PATH = 'archive/ResNet-50-params.mat'
+    NUM_TEST_CROPS = 4
 
     def __init__(self,
-                 image,
-                 class_name=None,
+                 learning_rate=Net.LEARNING_RATE,
+                 learning_modes=Net.LEARNING_RATE_MODES,
+                 learning_rate_decay_steps=Net.LEARNING_RATE_DECAY_STEPS,
+                 learning_rate_decay_rate=Net.LEARNING_RATE_DECAY_RATE,
+                 weight_decay=Net.WEIGHT_DECAY,
                  resnet_params_path=RESNET_PARAMS_PATH,
-                 working_dir=None,
+                 num_test_crops=NUM_TEST_CROPS,
                  is_train=False,
                  is_show=False):
 
         super(ResNet, self).__init__(
-            image,
-            class_name,
-            working_dir=working_dir,
+            learning_rate=learning_rate,
+            learning_modes=learning_modes,
+            learning_rate_decay_steps=learning_rate_decay_steps,
+            learning_rate_decay_rate=learning_rate_decay_rate,
+            weight_decay=weight_decay,
             is_train=is_train,
             is_show=is_show)
-        self.resnet_params_path = resnet_params_path
-        self.mean_path = self.mean_path
 
+        self.resnet_params_path = resnet_params_path
+        self.num_test_crops = num_test_crops
         if not self.checkpoint:
-            self.resnet_params = scipy.io.loadmat(self.resnet_params_path)
+            self.resnet_params = scipy.io.loadmat(resnet_params_path)
 
     def get_initializer(self, name, index, is_vector, default):
         if self.checkpoint:
@@ -345,7 +438,7 @@ class ResNet(Net):
     def conv(self, value, conv_name, out_channel, size=(1, 1), stride=(1, 1), padding='SAME', biased=False, norm_name=None, activation_fn=None, learning_mode='normal'):
         in_channel = image_util.get_channel(value)
 
-        if Net.LEARNING_MODES[learning_mode] > 0:
+        if self.learning_modes[learning_mode] > 0:
             collections = Net.NET_COLLECTIONS + [learning_mode]
             trainable = True
         else:
@@ -358,8 +451,8 @@ class ResNet(Net):
             is_vector=False,
             default=tf.truncated_normal_initializer(stddev=(2. / (in_channel * stride[0] * stride[1])) ** 0.5))
 
-        if Net.WEIGHT_DECAY > 0:
-            weight_regularizer = tf.contrib.layers.l2_regularizer(Net.WEIGHT_DECAY)
+        if self.weight_decay > 0:
+            weight_regularizer = tf.contrib.layers.l2_regularizer(self.weight_decay)
         else:
             weight_regularizer = None
 
@@ -490,39 +583,50 @@ class ResNet(Net):
         value = value / tf.reduce_sum(value, reduction_indices=dim, keep_dims=True)
         return value
 
-    def segment_mean(self, value, phase):
-        # TODO: move to ImagePipeline
+    def segment_mean(self, value):
+        shape = image_util.get_shape(value)
         def test_segment_mean(value):
-            shape = image_util.get_shape(value)
-            reduced_batch_size = shape[0] / ImagePipeline.NUM_TEST_CROPS
-            value = tf.segment_mean(value, np.repeat(np.arange(reduced_batch_size), ImagePipeline.NUM_TEST_CROPS))
-            value.set_shape((reduced_batch_size,) + shape[1:])
+            batch_size = shape[0] / self.num_test_crops
+            value = tf.segment_mean(value, np.repeat(np.arange(batch_size), self.num_test_crops))
             return value
 
-        value = tf.case([
-            (tf.equal(phase, Net.Phase.TRAIN), lambda: value),
-            (tf.equal(phase, Net.Phase.TEST), lambda: test_segment_mean(value))], default=lambda: value)
+        value = self.case([
+            (Net.Phase.TRAIN, lambda: value),
+            (Net.Phase.TEST, lambda: test_segment_mean(value))])
+
+        value.set_shape((None,) + shape[1:])
+        return value
 
 
 class ResNet50(ResNet):
     def __init__(self,
-                 image,
-                 class_name=None,
-                 resnet_params_path=None,
-                 working_dir=None,
+                 learning_rate=Net.LEARNING_RATE,
+                 learning_modes=Net.LEARNING_RATE_MODES,
+                 learning_rate_decay_steps=Net.LEARNING_RATE_DECAY_STEPS,
+                 learning_rate_decay_rate=Net.LEARNING_RATE_DECAY_RATE,
+                 weight_decay=Net.WEIGHT_DECAY,
+                 resnet_params_path=ResNet.RESNET_PARAMS_PATH,
+                 num_test_crops=ResNet.NUM_TEST_CROPS,
                  is_train=False,
                  is_show=False):
 
         super(ResNet50, self).__init__(
-            image,
-            class_name,
+            learning_rate=learning_rate,
+            learning_modes=learning_modes,
+            learning_rate_decay_steps=learning_rate_decay_steps,
+            learning_rate_decay_rate=learning_rate_decay_rate,
+            weight_decay=weight_decay,
             resnet_params_path=resnet_params_path,
-            working_dir=working_dir,
+            num_test_crops=num_test_crops,
             is_train=is_train,
             is_show=is_show)
 
+    def build(self, image, label):
+        self.image = image
+        self.label = label
+
         with tf.variable_scope('1'):
-            self.v0 = sele.conv(self.image, 'conv1', size=(7, 7), stride=(2, 2), out_channel=64, biased=True, norm_name='_conv1', activation_fn=tf.nn.relu, learning_mode='slow')
+            self.v0 = self.conv(image, 'conv1', size=(7, 7), stride=(2, 2), out_channel=64, biased=True, norm_name='_conv1', activation_fn=tf.nn.relu, learning_mode='slow')
             self.v1 = self.max_pool(self.v0, 'max_pool', size=(3, 3), stride=(2, 2))
 
         self.v2 = self.block(self.v1, '2', num_units=3, subsample=False, out_channel=64, learning_mode='slow')
@@ -532,11 +636,11 @@ class ResNet50(ResNet):
 
         with tf.variable_scope('fc'):
             self.v6 = self.avg_pool(self.v5, 'avg_pool', size=(7, 7))
-            self.v7 = self.conv(self.v6, 'fc', out_channel=Input.NUM_CLASSES, biased=True)
+            self.v7 = self.conv(self.v6, 'fc', out_channel=len(Meta.CLASS_NAMES), biased=True)
             self.v8 = tf.squeeze(self.softmax(self.v7, 3), (1, 2))
 
-        self.feat = self.segment_mean(self.v6, self.phase)
-        self.prob = self.segment_mean(self.v8, self.phase)
+        self.feat = self.segment_mean(self.v6)
+        self.prob = self.segment_mean(self.v8)
 
         self.make_stat()
 
@@ -549,32 +653,41 @@ class ResNet50(ResNet):
         self.finalize()
 
     def train(self, iteration, feed_dict=dict()):
-        updates_per_iteration = util.merge_dicts(
-            dict(
-                train=self.train_op,
-                summary=self.summary),
-            self.show_dict[Net.Phase.TRAIN])
-
-        feed_dict[self.phase] = Net.Phase.TRAIN
+        train_dict = dict(train=self.train_op)
+        show_dict = self.show_dict[Net.Phase.TRAIN]
+        summary_dict = dict(summary=self.summary[Net.Phase.TRAIN])
 
         self.model.train(
             iteration=iteration,
-            feed_dict=feed_dict,
+            feed_dict=util.merge_dicts(feed_dict, {self.phase: Net.Phase.TRAIN.value}),
             callbacks=[
-                dict(fetch=updates_per_iteration),
-                dict(fetch=self.show_dict[Net.Phase.TRAIN],
+                dict(fetch=util.merge_dicts(train_dict, show_dict, summary_dict)),
+                dict(fetch=show_dict,
                      func=lambda **kwargs: self.model.display(begin='Train', end='\n', **kwargs)),
                 dict(interval=5,
-                     fetch=dict(summary=self.summary),
+                     fetch=summary_dict,
                      func=lambda **kwargs: self.model.summary(summary_writer=self.summary_writer, **kwargs)),
+                dict(interval=5,
+                     func=lambda **kwargs: self.test(feed_dict=feed_dict)),
                 dict(interval=1000,
-                     func=lambda **kwargs: self.model.save(saver=self.saver, saver_kwargs=dict(save_path=os.path.join(WORKING_DIR, 'model')), **kwargs))])
+                     func=lambda **kwargs: self.model.save(saver=self.saver, saver_kwargs=dict(save_path=os.path.join(Meta.WORKING_DIR, 'model')), **kwargs))])
 
-    def test(self):
-        pass  # TODO
+    def test(self, iteration=1, feed_dict=dict()):
+        show_dict = self.show_dict[Net.Phase.TEST]
+        summary_dict = dict(summary=self.summary[Net.Phase.TEST])
+
+        self.model.test(
+            iteration=iteration,
+            feed_dict=util.merge_dicts(feed_dict, {self.phase: Net.Phase.TEST.value}),
+            callbacks=[
+                dict(fetch=util.merge_dicts(show_dict, summary_dict)),
+                dict(fetch=show_dict,
+                     func=lambda **kwargs: self.model.display(begin='\033[2K\rTest', end='\n', **kwargs)),
+                dict(fetch=summary_dict,
+                     func=lambda **kwargs: self.model.summary(summary_writer=self.summary_writer, **kwargs))])
 
     def online(self, fetch, feed_dict=dict()):
-        feed_dict[self.phase] = Net.Phase.TEST
+        feed_dict[self.phase] = Net.Phase.TEST.value
 
         self.model.test(
             iteration=1,

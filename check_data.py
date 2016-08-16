@@ -1,26 +1,33 @@
-#!/usr/bin/env python
 from __future__ import print_function
 
-import gflags
+import joblib
+import os
+import wand.image
+import wand.exceptions
 import sys
-import tensorflow as tf
 
-import data
 
-gflags.DEFINE_string('train_dir', None, '')
-gflags.DEFINE_integer('batch_size', 64, '')
-FLAGS = gflags.FLAGS
-FLAGS(sys.argv)
+def get_filename_list(image_dir):
+    filename_list = list()
+    for class_name in os.listdir(image_dir):
+        class_dir = os.path.join(image_dir, class_name)
+        if class_name.startswith('.') or not os.path.isdir(class_dir):
+            continue
+        for (file_dir, _, file_names) in os.walk(class_dir):
+            for file_name in file_names:
+                if not file_name.endswith('.jpg'):
+                    continue
+                filename_list.append(os.path.join(file_dir, file_name))
+    return filename_list
 
-data.cache_train_files(directory=FLAGS.train_dir, recache=True)
-train_files = data.get_files(data.TRAIN, num_pipelines=8)
-values = data.get_test_values(train_files, batch_size=FLAGS.batch_size, num_test_crops=1)
-
-sess = tf.Session()
-tf.train.start_queue_runners(sess=sess)
-
-num_batches = int(sum(map(len, train_files)) / FLAGS.batch_size) + 1
-for i in xrange(num_batches):
-    print('%d / %d\r' % (i, num_batches), end='')
+def load_file(num_file, filename):
+    try:
+        image = wand.image.Image(filename=filename)
+    except wand.exceptions.CorruptImageError:
+        os.remove(filename)
+        print('Remove %s' % file_path)
+    print('\033[2K\r# %d' % num_file, end='')
     sys.stdout.flush()
-    sess.run(values)
+
+parallel = joblib.Parallel(n_jobs=8, backend='threading')
+parallel(joblib.delayed(load_file)(num_file, filename) for (num_file, filename) in enumerate(get_filename_list('/mnt/data/dish-clean')))
