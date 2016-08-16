@@ -1,7 +1,6 @@
 '''
 TODO
-1: ImageLabel format class
-2: Seperate file pool
+1. Image reading threads
 '''
 
 from __future__ import print_function
@@ -44,7 +43,37 @@ class Meta(object):
             Meta.CLASS_NAMES = np.loadtxt(Meta.classnamesPath(), dtype=np.str, delimiter=',')
 
 
-class InputProducer(object):
+class Blob(object):
+    def __init__(self, image=None, label=None, images=None, labels=None, imageLabels=None):
+        assert (image is not None) + (images is not None) + (imageLabels is not None) == 1, 'Too many arguments!'
+
+        if image is not None:
+            label = tf.constant(-1, dtype=tf.int64) if label is None else label
+            self.image = image
+            self.label = label
+
+            images = [image]
+            labels = [label]
+        elif images is not None:
+            labels = [tf.constant(-1, dtype=tf.int64) for _ in xrange(len(images))] if labels is None else labels
+        else:
+            (images, labels) = zip(*imageLabels)
+
+        self.images = images
+        self.labels = labels
+
+    def as_tuple_list(self):
+        return zip(self.images, self.labels)
+
+    def func(self, f):
+        return f(self)
+
+
+class Producer(object):
+    NUM_TRAIN_INPUTS = 8
+    NUM_TEST_INPUTS = 1
+    SUBSAMPLE_SIZE = 64
+
     @staticmethod
     def get_queue(value_list, dtype):
         queue = tf.FIFOQueue(32, dtypes=[dtype], shapes=[()])
@@ -53,14 +82,25 @@ class InputProducer(object):
         tf.train.add_queue_runner(queue_runner)
         return queue
 
-    def fromPlaceholder(self, image, label=None):
-        if label is None:
-            label = tf.constant(-1, dtype=tf.int64)
-        return (image, label)
+    def __init__(self,
+                 num_train_inputs=NUM_TRAIN_INPUTS,
+                 num_test_inputs=NUM_TEST_INPUTS,
+                 subsample_size=SUBSAMPLE_SIZE):
 
-    def fromFile(self, image_dir, is_train=False, subsample_size=1, subsample_divisible=True, check=False, shuffle=False):
+        self.num_train_inputs = num_train_inputs
+        self.num_test_inputs = num_test_inputs
+        self.subsample_size = subsample_size
+
+    def _file(self,
+              image_dir,
+              num_inputs=1,
+              subsample_size=1,
+              subsample_divisible=True,
+              is_train=False,
+              check=False,
+              shuffle=False):
+
         filename_list = list()
-        hash_list = list()
         classname_list = list()
 
         for class_name in os.listdir(image_dir):
@@ -75,6 +115,12 @@ class InputProducer(object):
                         continue
                     filename_list.append(os.path.join(file_dir, file_name))
                     classname_list.append(class_name)
+
+        class_names = sorted(set(classname_list))
+        label_list = map(class_names.index, classname_list)
+
+        if is_train:
+            Meta.save(class_names=class_names)
 
         if check:
             num_file_list = list()
@@ -91,30 +137,58 @@ class InputProducer(object):
             print('')
 
             filename_list = map(filename_list.__getitem__, num_file_list)
-            classname_list = map(classname_list.__getitem__, num_file_list)
+            label_list = map(label_list.__getitem__, num_file_list)
 
-        if shuffle:
-            perm = np.random.permutation(len(filename_list))
-            filename_list = map(filename_list.__getitem__, perm)
-            classname_list = map(classname_list.__getitem__, perm)
+        imageLabels = list()
+        for num_input in xrange(num_inputs):
+            if shuffle:
+                perm = np.random.permutation(len(filename_list))
+                filename_list = map(filename_list.__getitem__, perm)
+                label_list = map(label_list.__getitem__, perm)
 
-        class_names = sorted(set(classname_list))
-        label_list = map(class_names.index, classname_list)
+            filename_queue = Producer.get_queue(filename_list, dtype=tf.string)
+            (key, value) = tf.WholeFileReader().read(filename_queue)
+            image = tf.to_float(tf.image.decode_jpeg(value))
 
-        filename_queue = InputProducer.get_queue(filename_list, dtype=tf.string)
-        (key, value) = tf.WholeFileReader().read(filename_queue)
-        image = tf.to_float(tf.image.decode_jpeg(value))
+            label_queue = Producer.get_queue(label_list, dtype=tf.int64)
+            label = label_queue.dequeue()
 
-        label_queue = InputProducer.get_queue(label_list, dtype=tf.int64)
-        label = label_queue.dequeue()
+            imageLabels.append((image, label))
 
-        if is_train:
-            Meta.save(class_names=class_names)
+        return Blob(imageLabels=imageLabels)
 
-        return (image, label)
+    def trainFile(self,
+                  image_dir,
+                  subsample_divisible=False,
+                  is_train=True,
+                  check=True,
+                  shuffle=True):
+
+        return self._file(image_dir,
+                          num_inputs=self.num_train_inputs,
+                          subsample_size=self.subsample_size,
+                          subsample_divisible=subsample_divisible,
+                          is_train=is_train,
+                          check=check,
+                          shuffle=shuffle)
+
+    def testFile(self,
+                 image_dir,
+                 subsample_divisible=True,
+                 is_train=False,
+                 check=False,
+                 shuffle=False):
+
+        return self._file(image_dir,
+                          num_inputs=self.num_test_inputs,
+                          subsample_size=self.subsample_size,
+                          subsample_divisible=subsample_divisible,
+                          is_train=is_train,
+                          check=check,
+                          shuffle=shuffle)
 
 
-class ImagePipeline(object):
+class Preprocess(object):
     NUM_TEST_CROPS = 4
     TRAIN_SIZE_RANGE = (256, 512)
     TEST_SIZE_RANGE = (384, 384)
@@ -141,105 +215,72 @@ class ImagePipeline(object):
         self.mean_path = mean_path
         self.mean = scipy.io.loadmat(mean_path)['mean']
 
-    def train(self, image):
-        image = tf.to_float(image)
+    def _train(self, image):
         image = image_util.random_resize(image, size_range=self.train_size_range)
         image = image_util.random_crop(image, size=self.net_size)
         image = image_util.random_flip(image)
         image = image_util.random_adjust_rgb(image)
         image = image - self.mean
-
         image.set_shape(self.shape)
+
         return image
 
-    def test(self, image):
-        image = tf.to_float(image)
+    def train(self, blob):
+        return Blob(images=map(self._train, blob.images), labels=blob.labels)
+
+    def _test_map(self, image):
+        image = image_util.random_resize(image, size_range=self.test_size_range)
+        image = image_util.random_crop(image, size=self.net_size)
+        image = image_util.random_flip(image)
+        image = image - self.mean
+
+        return image
+
+    def _test(self, image):
         image = tf.tile(tf.expand_dims(image, dim=0), multiples=(self.num_test_crops, 1, 1, 1))
-
-        def test_image_map(image):
-            image = image_util.random_resize(image, size_range=self.test_size_range)
-            image = image_util.random_crop(image, size=self.net_size)
-            image = image_util.random_flip(image)
-            image = image - self.mean
-            return image
-
-        image = tf.map_fn(test_image_map, image)
+        image = tf.map_fn(self._test_map, image)
         image.set_shape((self.num_test_crops,) + self.shape)
+
         return image
 
-    def online(self, image):
-        return self.test(image)
-
-
-class ImageLabelPipeline(ImagePipeline):
-    def __init__(self,
-                 num_test_crops=ImagePipeline.NUM_TEST_CROPS,
-                 train_size_range=ImagePipeline.TRAIN_SIZE_RANGE,
-                 test_size_range=ImagePipeline.TEST_SIZE_RANGE,
-                 net_size=ImagePipeline.NET_SIZE,
-                 net_channel=ImagePipeline.NET_CHANNEL,
-                 mean_path=ImagePipeline.MEAN_PATH):
-
-        super(ImageLabelPipeline, self).__init__(
-            num_test_crops=num_test_crops,
-            train_size_range=train_size_range,
-            test_size_range=test_size_range,
-            net_size=net_size,
-            net_channel=net_channel,
-            mean_path=mean_path)
-
-    def train(self, image, label):
-        return (super(ImageLabelPipeline, self).train(image), label)
-
-    def test(self, image, label):
-        return (super(ImageLabelPipeline, self).test(image), label)
-
-    def online(self, image, label):
-        return (super(ImageLabelPipeline, self).online(image), label)
+    def test(self, blob):
+        return Blob(images=map(self._test, blob.images), labels=blob.labels)
 
 
 class Batch(object):
     BATCH_SIZE = 64
-    CAPACITY = 4096 + 512
+    CAPACITY = 4096 + 1024
     MIN_AFTER_DEQUEUE = 4096
     NUM_TEST_CROPS = 4
-    NUM_TRAIN_THREADS = 8
-    NUM_TEST_THREADS = 1
 
     def __init__(self,
                  batch_size=BATCH_SIZE,
                  capacity=CAPACITY,
                  min_after_dequeue=MIN_AFTER_DEQUEUE,
-                 num_test_crops=NUM_TEST_CROPS,
-                 num_train_threads=NUM_TRAIN_THREADS,
-                 num_test_threads=NUM_TEST_THREADS):
+                 num_test_crops=NUM_TEST_CROPS):
 
         self.batch_size = batch_size
         self.capacity = capacity
         self.min_after_dequeue = min_after_dequeue
         self.num_test_crops = num_test_crops
-        self.num_train_threads = num_train_threads
-        self.num_test_threads = num_test_threads
 
-    def train(self, image, label):
-        (image, label) = tf.train.shuffle_batch(
-            (image, label),
+    def train(self, blob):
+        (image, label) = tf.train.shuffle_batch_join(
+            blob.as_tuple_list(),
             batch_size=self.batch_size,
-            num_threads=self.num_train_threads,
             capacity=self.capacity,
             min_after_dequeue=self.min_after_dequeue)
-        return (image, label)
+        return Blob(image=image, label=label)
 
-    def test(self, image, label):
-        (image, label) = tf.train.batch(
-            (image, label),
+    def test(self, blob):
+        (image, label) = tf.train.batch_join(
+            blob.as_tuple_list(),
             batch_size=self.batch_size / self.num_test_crops,
-            num_threads=self.num_test_threads,
             capacity=self.batch_size / self.num_test_crops)
 
         shape = image_util.get_shape(image)
         image = tf.reshape(image, (self.batch_size,) + shape[2:])
-        return (image, label)
+        return Blob(image=image, label=label)
 
 
 class Net(object):
@@ -301,7 +342,7 @@ class Net(object):
                  weight_decay=WEIGHT_DECAY,
                  is_train=False,
                  is_show=False):
-        assert Meta.CLASS_NAMES, 'Only create net when Meta.CLASS_NAMES is not empty!'
+        assert len(Meta.CLASS_NAMES), 'Only create net when Meta.CLASS_NAMES is not empty!'
 
         self.learning_rate = Net.get_const_variable(learning_rate, 'learning_rate')
         self.learning_modes = learning_modes
@@ -322,9 +363,10 @@ class Net(object):
                 decay_rate=learning_rate_decay_rate,
                 staircase=True)
 
-    def case(self, phase_fn_pairs):
+    def case(self, phase_fn_pairs, shape=None):
         pred_fn_pairs = [(tf.equal(self.phase, phase_.value), fn) for (phase_, fn) in phase_fn_pairs]
         value = tf.case(pred_fn_pairs, default=pred_fn_pairs[0][1])
+        value.set_shape(shape)
         return value
 
     def make_stat(self):
@@ -585,6 +627,7 @@ class ResNet(Net):
 
     def segment_mean(self, value):
         shape = image_util.get_shape(value)
+
         def test_segment_mean(value):
             batch_size = shape[0] / self.num_test_crops
             value = tf.segment_mean(value, np.repeat(np.arange(batch_size), self.num_test_crops))
@@ -621,12 +664,12 @@ class ResNet50(ResNet):
             is_train=is_train,
             is_show=is_show)
 
-    def build(self, image, label):
-        self.image = image
-        self.label = label
+    def build(self, blob):
+        assert len(blob.as_tuple_list()) == 1, 'Must pass in a single pair of image and label'
+        (self.image, self.label) = blob.as_tuple_list()[0]
 
         with tf.variable_scope('1'):
-            self.v0 = self.conv(image, 'conv1', size=(7, 7), stride=(2, 2), out_channel=64, biased=True, norm_name='_conv1', activation_fn=tf.nn.relu, learning_mode='slow')
+            self.v0 = self.conv(self.image, 'conv1', size=(7, 7), stride=(2, 2), out_channel=64, biased=True, norm_name='_conv1', activation_fn=tf.nn.relu, learning_mode='slow')
             self.v1 = self.max_pool(self.v0, 'max_pool', size=(3, 3), stride=(2, 2))
 
         self.v2 = self.block(self.v1, '2', num_units=3, subsample=False, out_channel=64, learning_mode='slow')

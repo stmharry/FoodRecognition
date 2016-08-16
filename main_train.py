@@ -1,33 +1,17 @@
 import time
-
-from ResNet import Meta, InputProducer, ImageLabelPipeline, Batch, Net, ResNet50
+from ResNet import Meta, Blob, Producer, Preprocess, Batch, Net, ResNet50
 
 WORKING_DIR = '/mnt/data/dish-clean-save/' + time.strftime('%Y-%m-%d-%H%M%S')
 IMAGE_DIR = '/mnt/data/dish-clean/'
-SUBSAMPLE_SIZE = 64  # train:val = 63:1
 IS_IMAGE_CHECKED = True
 
 Meta.load(working_dir=WORKING_DIR)
-
-inputProducer = InputProducer()
-imageLabelPipeline = ImageLabelPipeline()
+producer = Producer()
+preprocess = Preprocess()
 batch = Batch()
 
-trainImageLabel = inputProducer.fromFile(
-    image_dir=IMAGE_DIR,
-    is_train=True,
-    subsample_size=SUBSAMPLE_SIZE,
-    subsample_divisible=False,
-    check=not IS_IMAGE_CHECKED,
-    shuffle=True)
-trainImageLabel = imageLabelPipeline.train(*trainImageLabel)
-trainImageLabel = batch.train(*trainImageLabel)
-
-testImageLabel = inputProducer.fromFile(
-    image_dir=IMAGE_DIR,
-    subsample_size=SUBSAMPLE_SIZE)
-testImageLabel = imageLabelPipeline.test(*testImageLabel)
-testImageLabel = batch.test(*testImageLabel)
+trainBlob = producer.trainFile(image_dir=IMAGE_DIR, check=not IS_IMAGE_CHECKED).func(preprocess.train).func(batch.train)
+testBlob = producer.testFile(image_dir=IMAGE_DIR).func(preprocess.test).func(batch.test)
 
 net = ResNet50(
     learning_rate=1e-1,
@@ -36,11 +20,15 @@ net = ResNet50(
     is_train=True,
     is_show=True)
 
-(image, label) = net.case([
-    (Net.Phase.TRAIN, lambda: trainImageLabel),
-    (Net.Phase.TEST, lambda: testImageLabel)])
-image.set_shape((batch.batch_size,) + imageLabelPipeline.shape)
-label.set_shape((None,))
+image = net.case([
+    (Net.Phase.TRAIN, lambda: trainBlob.image),
+    (Net.Phase.TEST, lambda: testBlob.image)],
+    shape=(batch.batch_size,) + preprocess.shape)
+label = net.case([
+    (Net.Phase.TRAIN, lambda: trainBlob.label),
+    (Net.Phase.TEST, lambda: testBlob.label)],
+    shape=(None,))
+blob = Blob(image=image, label=label)
 
-net.build(image=image, label=label)
+net.build(blob)
 net.train(iteration=10000)
